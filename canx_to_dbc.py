@@ -2,6 +2,16 @@
 import xml.etree.ElementTree as ET
 import argparse
 import os
+import math
+
+def parse_int_safe(s, base=10, default=0):
+    try:
+        return int(s, base)
+    except Exception:
+        try:
+            return int(s)
+        except Exception:
+            return default
 
 def canx_to_dbc(input_file, output_file):
     tree = ET.parse(input_file)
@@ -20,55 +30,104 @@ def canx_to_dbc(input_file, output_file):
         cid = mob.attrib.get("canbusID")
         base_id = int(cid, 16)
 
-        dlc = int(mob.attrib.get("width"))
+        declared_width = parse_int_safe(mob.attrib.get("width", "0"))
 
-        # Each frame -> one BO_ message with ID = base_id + offset
+        # For each frame we will compute actual DLC from channels
         for frame in mob.findall("frame"):
-            frame_offset = int(frame.attrib.get("offset", "0"))
+            frame_offset = parse_int_safe(frame.attrib.get("offset", "0"))
             real_id = base_id + frame_offset   # integer (we'll print decimal)
             frame_name = f"{msg_name}_f{frame_offset}"
 
+            # collect channels first to determine DLC properly
+            channels = list(frame.findall("channel"))
+
+            # Determine max used byte based on byteOffset + bitCount/bitPosition
+            max_used_byte = -1
+            parsed_channels = []
+            for ch in channels:
+                sig_name = ch.attrib.get("id")
+                byte_offset = parse_int_safe(ch.attrib.get("byteOffset", "0"))
+                bit_count_attr = ch.attrib.get("bitCount")
+                bit_position_attr = ch.attrib.get("bitPosition")
+                type_info = ch.attrib.get("type", "u8")
+                unit = ch.attrib.get("unit", "")
+
+                # bit size: prefer bitCount, fallback to type (u8/u16/...)
+                if bit_count_attr is not None and bit_count_attr != "":
+                    bit_size = parse_int_safe(bit_count_attr)
+                else:
+                    if "64" in type_info:
+                        bit_size = 64
+                    elif "32" in type_info:
+                        bit_size = 32
+                    elif "16" in type_info:
+                        bit_size = 16
+                    else:
+                        bit_size = 8
+
+                # bit position inside the byte: default 0 if not provided
+                bit_pos = parse_int_safe(bit_position_attr, default=0)
+
+                # compute last bit position relative to this byte (bit_pos + bit_size - 1)
+                last_bit_in_field = bit_pos + bit_size - 1
+                extra_bytes = last_bit_in_field // 8
+                last_used_byte = byte_offset + extra_bytes
+                if last_used_byte > max_used_byte:
+                    max_used_byte = last_used_byte
+
+                parsed_channels.append({
+                    "elem": ch,
+                    "name": sig_name,
+                    "byte_offset": byte_offset,
+                    "bit_pos": bit_pos,
+                    "bit_size": bit_size,
+                    "type_info": type_info,
+                    "unit": unit
+                })
+
+            # final dlc is the maximum between declared width and detected used bytes
+            dlc_detected = max_used_byte + 1 if max_used_byte >= 0 else declared_width
+            dlc = max(declared_width, dlc_detected)
+
             dbc_lines.append(f"\nBO_ {real_id} {frame_name}: {dlc} Vector__XXX")
 
-            for ch in frame.findall("channel"):
-                sig_name = ch.attrib.get("id")
-                byte_offset = int(ch.attrib.get("byteOffset", "0"))
-                unit = ch.attrib.get("unit", "")
-                type_info = ch.attrib.get("type", "u8")
+            # now build SG_ lines
+            for pc in parsed_channels:
+                sig_name = pc["name"]
+                byte_offset = pc["byte_offset"]
+                bit_pos = pc["bit_pos"]
+                bit_size = pc["bit_size"]
+                type_info = pc["type_info"]
+                unit = pc["unit"]
 
-                # endian + signed
-                is_big_endian = "-be" in type_info or type_info.startswith("s") and "-be" in type_info
+                # determine endian + signed
+                is_big_endian = "-be" in type_info
                 is_signed = type_info.startswith("s")
                 endian_flag = 0 if is_big_endian else 1  # DBC: 0=big (Motorola), 1=little (Intel)
 
-                # bit length
-                if "64" in type_info:
-                    bit_size = 64
-                elif "32" in type_info:
-                    bit_size = 32
-                elif "16" in type_info:
-                    bit_size = 16
-                else:
-                    bit_size = 8
-
                 # START BIT calculation:
-                # - Little-endian (Intel): start = byte_offset*8  (LSB-first)
-                # - Big-endian (Motorola): start = byte_offset*8 + 7  (MSB of that byte)
+                # - Little-endian (Intel): start = byte_offset*8 + bitPosition
+                # - Big-endian (Motorola): start = byte_offset*8 + (7 - bitPosition)
                 if is_big_endian:
-                    bit_start = byte_offset * 8 + 7
+                    bit_start = byte_offset * 8 + (7 - bit_pos)
                 else:
-                    bit_start = byte_offset * 8
+                    bit_start = byte_offset * 8 + bit_pos
+
+                # default scaling & range (can be extended to parse multiplier/offset if present)
+                factor = 1
+                offset = 0
+                minimum = 0
+                maximum = 0
 
                 dbc_lines.append(
                     f" SG_ {sig_name} : {bit_start}|{bit_size}@{endian_flag}{'-' if is_signed else '+'} "
-                    f"(1,0) [0|0] \"{unit}\" Vector__XXX"
+                    f"({factor},{offset}) [{minimum}|{maximum}] \"{unit}\" Vector__XXX"
                 )
 
     with open(output_file, "w", encoding="utf-8") as f:
         f.write("\n".join(dbc_lines))
 
     print(f"[OK] DBC generated: {output_file}")
-
 
 def main():
     parser = argparse.ArgumentParser(description="Convert Ecumaster .canx to .dbc")
@@ -81,7 +140,6 @@ def main():
         return
 
     canx_to_dbc(args.input, args.output)
-
 
 if __name__ == "__main__":
     main()
